@@ -151,9 +151,17 @@ HOME_DIR = os.path.expanduser("~")
 # Base data directory for KookAI settings & pairing configs
 GEMINI_DATA_DIR = os.path.join(HOME_DIR, ".gemini")
 ANTIGRAVITY_DATA_DIR = os.path.join(GEMINI_DATA_DIR, "kookai")
-ANTIGRAVITY_CLI_DIR = os.path.join(GEMINI_DATA_DIR, "kookai-cli")
+ANTIGRAVITY_CLI_DIR = os.path.join(GEMINI_DATA_DIR, "antigravity-cli")
+KOOKAI_CLI_DIR = os.path.join(GEMINI_DATA_DIR, "kookai-cli")
 LEGACY_ANTIGRAVITY_DATA_DIR = os.path.join(GEMINI_DATA_DIR, "antigravity")
 LEGACY_ANTIGRAVITY_CLI_DIR = os.path.join(GEMINI_DATA_DIR, "antigravity-cli")
+ALL_ANTIGRAVITY_CLI_DIRS = [
+    ANTIGRAVITY_CLI_DIR,
+    LEGACY_ANTIGRAVITY_CLI_DIR,
+    KOOKAI_CLI_DIR,
+    ANTIGRAVITY_DATA_DIR,
+    LEGACY_ANTIGRAVITY_DATA_DIR,
+]
 DESKTOP_DIR = os.path.join(HOME_DIR, "Desktop")
 if os.name == "nt":
     try:
@@ -1810,14 +1818,11 @@ def get_zai_conversation(conversation_id: str) -> Optional[dict]:
     return record if isinstance(record, dict) else None
 
 
-# Helper: Get all database file names (conversation IDs) in kookai folders
-def get_existing_db_ids():
-    db_paths = [
-        os.path.join(ANTIGRAVITY_CLI_DIR, "conversations/*.db"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, "conversations/*.db")
-    ]
+# Helper: Get all database file names (conversation IDs) in antigravity/kookai folders
+def get_existing_db_ids() -> set[str]:
     ids = set()
-    for pattern in db_paths:
+    for base_dir in ALL_ANTIGRAVITY_CLI_DIRS:
+        pattern = os.path.join(base_dir, "conversations/*.db")
         for f in glob.glob(pattern):
             ids.add(os.path.basename(f)[:-3])
     return ids
@@ -2029,9 +2034,15 @@ def resolve_workspace_dir_safely(workspace_str: str) -> str:
 
 
 def get_conversation_project(conversation_id: str) -> Optional[str]:
+    meta = _load_conversation_metadata().get(conversation_id)
+    if meta and meta.get("project"):
+        return clean_project_name(meta["project"])
+    canonical = get_canonical_conversation(conversation_id)
+    if canonical and canonical.get("project"):
+        return clean_project_name(canonical["project"])
+
     hist_paths = [
-        os.path.join(ANTIGRAVITY_CLI_DIR, "history.jsonl"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, "history.jsonl")
+        os.path.join(base_dir, "history.jsonl") for base_dir in ALL_ANTIGRAVITY_CLI_DIRS
     ]
     for hist_path in hist_paths:
         if not os.path.exists(hist_path):
@@ -2082,15 +2093,13 @@ def infer_project_from_conversation_artifacts(folder: str) -> Optional[str]:
 # Helper: Parse local conversation transcripts from brain folders
 def get_real_conversations():
     brain_paths = [
-        os.path.join(ANTIGRAVITY_CLI_DIR, "brain/*"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, "brain/*")
+        os.path.join(base_dir, "brain/*") for base_dir in ALL_ANTIGRAVITY_CLI_DIRS
     ]
     
     # Map conversationId -> project using history.jsonl if possible
     cid_to_project = {}
     hist_paths = [
-        os.path.join(ANTIGRAVITY_CLI_DIR, "history.jsonl"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, "history.jsonl")
+        os.path.join(base_dir, "history.jsonl") for base_dir in ALL_ANTIGRAVITY_CLI_DIRS
     ]
     for hist_path in hist_paths:
         if os.path.exists(hist_path):
@@ -2233,14 +2242,13 @@ def map_model_name(model_ui_name: str) -> str:
 # Helper: Kill processes locking the sqlite database or executing agy for this conversation
 def kill_processes_locking_db(conversation_id: str):
     cid = sanitize_conversation_id(conversation_id)
-    db_files = [
-        os.path.join(ANTIGRAVITY_DATA_DIR, f"conversations/{cid}.db"),
-        os.path.join(ANTIGRAVITY_CLI_DIR, f"conversations/{cid}.db"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, f"conversations/{cid}.db-wal"),
-        os.path.join(ANTIGRAVITY_CLI_DIR, f"conversations/{cid}.db-wal"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, f"conversations/{cid}.db-shm"),
-        os.path.join(ANTIGRAVITY_CLI_DIR, f"conversations/{cid}.db-shm"),
-    ]
+    db_files = []
+    for base_dir in ALL_ANTIGRAVITY_CLI_DIRS:
+        db_files.extend([
+            os.path.join(base_dir, f"conversations/{cid}.db"),
+            os.path.join(base_dir, f"conversations/{cid}.db-wal"),
+            os.path.join(base_dir, f"conversations/{cid}.db-shm"),
+        ])
     if os.name != "nt":
         for db_path in db_files:
             try:
@@ -2620,11 +2628,6 @@ def run_agy_cli(message: str, model_ui_name: str, conversation_id: str, target: 
     mapped_model = map_model_name(model_ui_name)
     project_id = clean_project_name(workspace or "agy")
     cwd_path = resolve_project_directory(project_id)
-    message_with_context = (
-        f"Selected KookAI project/workspace: {project_id}\n"
-        f"Workspace directory: {cwd_path}\n\n"
-        f"User message:\n{message}"
-    )
 
     def command_output(result):
         return "\n".join(part for part in [
@@ -2657,7 +2660,7 @@ def run_agy_cli(message: str, model_ui_name: str, conversation_id: str, target: 
     
     # Resolve temporary frontend ID if mapped
     mapping_key = f"{project_id}:{conversation_id}"
-    actual_cid = convo_id_mapping.get(mapping_key, conversation_id)
+    actual_cid = convo_id_mapping.get(mapping_key) or convo_id_mapping.get(conversation_id) or conversation_id
     
     # Get current DB list before running command
     before_dbs = get_existing_db_ids()
@@ -2669,6 +2672,34 @@ def run_agy_cli(message: str, model_ui_name: str, conversation_id: str, target: 
         if existing_project and existing_project != project_id:
             logging.info(f"Conversation {actual_cid} belongs to {existing_project}; starting new conversation in {project_id}.")
             use_continue = False
+
+    history_context = ""
+    if not use_continue:
+        prior_messages = in_memory_chats.get(actual_cid) or in_memory_chats.get(conversation_id)
+        if not prior_messages:
+            canonical = get_canonical_conversation(actual_cid) or get_canonical_conversation(conversation_id)
+            if canonical and canonical.get("messages"):
+                prior_messages = canonical["messages"]
+        if prior_messages:
+            history_lines = []
+            for msg in prior_messages[-20:]:
+                role = "User" if msg.get("role") == "user" else "Assistant"
+                c = (msg.get("content") or "").strip()
+                if c:
+                    history_lines.append(f"[{role}]: {c}")
+            if history_lines:
+                history_context = (
+                    "[Previous Conversation History]\n"
+                    + "\n\n".join(history_lines)
+                    + "\n[End of Previous Conversation History]\n\n"
+                )
+
+    message_with_context = (
+        f"Selected KookAI project/workspace: {project_id}\n"
+        f"Workspace directory: {cwd_path}\n\n"
+        f"{history_context}"
+        f"User message:\n{message}"
+    )
 
     agy_path = (
         resolve_managed_cli_executable("agy")
@@ -2694,6 +2725,26 @@ def run_agy_cli(message: str, model_ui_name: str, conversation_id: str, target: 
     cmd += ["--print", message_with_context]
         
     logging.info(f"Executing agy CLI in {cwd_path}: {' '.join(cmd)}")
+
+    def select_newest_cid(candidate_ids):
+        if not candidate_ids:
+            return conversation_id
+        if len(candidate_ids) == 1:
+            return list(candidate_ids)[0]
+        newest = list(candidate_ids)[0]
+        newest_mtime = -1.0
+        for cid in candidate_ids:
+            for base_dir in ALL_ANTIGRAVITY_CLI_DIRS:
+                p = os.path.join(base_dir, f"conversations/{cid}.db")
+                if os.path.exists(p):
+                    try:
+                        mt = os.path.getmtime(p)
+                        if mt > newest_mtime:
+                            newest_mtime = mt
+                            newest = cid
+                    except OSError:
+                        pass
+        return newest
     
     try:
         result = run_agy_command(cmd, cwd_path, timeout=AGY_CLI_TIMEOUT, progress_callback=progress_callback)
@@ -2746,9 +2797,25 @@ def run_agy_cli(message: str, model_ui_name: str, conversation_id: str, target: 
             after_dbs = get_existing_db_ids()
             new_ids = after_dbs - before_dbs
             if new_ids:
-                resolved_cid = list(new_ids)[0]
+                resolved_cid = select_newest_cid(new_ids)
                 convo_id_mapping[mapping_key] = resolved_cid
+                convo_id_mapping[conversation_id] = resolved_cid
+                convo_id_mapping[actual_cid] = resolved_cid
                 logging.info(f"Resolved new conversation ID mapping: {mapping_key} -> {resolved_cid}")
+            elif result.stdout:
+                clean_stdout = result.stdout.strip()
+                if clean_stdout.startswith("{") and clean_stdout.endswith("}"):
+                    try:
+                        parsed_json = json.loads(clean_stdout)
+                        if isinstance(parsed_json, dict) and parsed_json.get("conversation_id"):
+                            cid_from_json = parsed_json["conversation_id"]
+                            if cid_from_json:
+                                resolved_cid = cid_from_json
+                                convo_id_mapping[mapping_key] = resolved_cid
+                                convo_id_mapping[conversation_id] = resolved_cid
+                                convo_id_mapping[actual_cid] = resolved_cid
+                    except Exception:
+                        pass
         
         if result.returncode == 0 and not is_recoverable_conversation_error(result):
             return result.stdout.strip(), resolved_cid
@@ -2779,8 +2846,10 @@ def run_agy_cli(message: str, model_ui_name: str, conversation_id: str, target: 
                 if result.returncode == 0 and not is_recoverable_conversation_error(result):
                     after_dbs = get_existing_db_ids()
                     new_ids = after_dbs - before_dbs
-                    resolved_cid = list(new_ids)[0] if new_ids else conversation_id
+                    resolved_cid = select_newest_cid(new_ids) if new_ids else conversation_id
                     convo_id_mapping[mapping_key] = resolved_cid
+                    convo_id_mapping[conversation_id] = resolved_cid
+                    convo_id_mapping[actual_cid] = resolved_cid
                     return result.stdout.strip(), resolved_cid
             except Exception as fb_err:
                 logging.warning(f"Fresh session fallback after timeout failed: {fb_err}")
@@ -5170,13 +5239,15 @@ async def cancel_chat_task_by_body_endpoint(request: Request, body: Optional[Can
 async def upload_media_endpoint(conversation_id: str, filename: str, request: Request):
     actual_cid = convo_id_mapping.get(conversation_id, conversation_id)
     actual_cid = sanitize_conversation_id(actual_cid)
-    # Default to kookai brain folder, fallback to kookai-cli
-    folder = os.path.join(ANTIGRAVITY_DATA_DIR, f"brain/{actual_cid}")
+    # Default to antigravity brain folder, fallback to kookai / kookai-cli
+    folder = os.path.join(ANTIGRAVITY_CLI_DIR, f"brain/{actual_cid}")
     try:
         if not os.path.exists(folder):
-            folder = os.path.join(ANTIGRAVITY_CLI_DIR, f"brain/{actual_cid}")
+            folder = os.path.join(ANTIGRAVITY_DATA_DIR, f"brain/{actual_cid}")
             if not os.path.exists(folder):
-                os.makedirs(folder, exist_ok=True)
+                folder = os.path.join(KOOKAI_CLI_DIR, f"brain/{actual_cid}")
+                if not os.path.exists(folder):
+                    os.makedirs(folder, exist_ok=True)
     except (OSError, ValueError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid upload path: {e}")
             
@@ -5289,12 +5360,8 @@ def fetch_antigravity_language_server_quota() -> Optional[dict[str, Any]]:
 
 def fetch_antigravity_token_usage(now_epoch: float) -> tuple[int, int]:
     """Calculate token usage for Antigravity / Gemini from local transcripts."""
-    brain_paths = [
-        os.path.join(LEGACY_ANTIGRAVITY_DATA_DIR, "brain/*"),
-        os.path.join(ANTIGRAVITY_CLI_DIR, "brain/*"),
-        os.path.join(ANTIGRAVITY_DATA_DIR, "brain/*"),
-        os.path.expanduser("~/.gemini/antigravity/brain/*"),
-    ]
+    brain_paths = [os.path.join(d, "brain/*") for d in ALL_ANTIGRAVITY_CLI_DIRS]
+    brain_paths.append(os.path.expanduser("~/.gemini/antigravity/brain/*"))
     weekly_tokens = 0
     hourly_tokens = 0
     scanned_folders = set()

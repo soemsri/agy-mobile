@@ -386,6 +386,85 @@ class CliApiTests(unittest.TestCase):
         self.assertNotIn("--continue", calls[-1])
         self.assertNotIn("--conversation", calls[-1])
 
+    def test_run_agy_cli_multi_turn_session_continuation(self):
+        calls = []
+        known_dbs = {"db-initial"}
+
+        def mock_run_command(cmd, cwd_path, timeout=600, progress_callback=None):
+            calls.append(list(cmd))
+            known_dbs.add("new-cid-uuid-1")
+            return subprocess.CompletedProcess(cmd, 0, stdout="Reply from turn", stderr="")
+
+        with (
+            mock.patch.object(main, "get_existing_db_ids", side_effect=lambda: set(known_dbs)),
+            mock.patch.object(main, "get_conversation_project", return_value="KookAI"),
+            mock.patch.object(main, "run_agy_command", side_effect=mock_run_command),
+        ):
+            # Turn 1: frontend sends temporary conversation id
+            reply1, cid1 = main.run_agy_cli(
+                message="Turn 1 prompt",
+                model_ui_name="Gemini 3.8 Flash (High)",
+                conversation_id="temp_user_conv_1",
+                target="Sandbox",
+                workspace="KookAI",
+            )
+            self.assertEqual(cid1, "new-cid-uuid-1")
+            self.assertNotIn("--continue", calls[0])
+            self.assertNotIn("--conversation", calls[0])
+
+            # Turn 2: frontend sends resolved cid
+            reply2, cid2 = main.run_agy_cli(
+                message="Turn 2 prompt",
+                model_ui_name="Gemini 3.8 Flash (High)",
+                conversation_id=cid1,
+                target="Sandbox",
+                workspace="KookAI",
+            )
+            self.assertEqual(cid2, "new-cid-uuid-1")
+            self.assertIn("--continue", calls[1])
+            self.assertIn("--conversation", calls[1])
+            convo_idx = calls[1].index("--conversation")
+            self.assertEqual(calls[1][convo_idx + 1], "new-cid-uuid-1")
+
+    def test_run_agy_cli_synthesizes_history_when_not_continuing(self):
+        calls = []
+
+        def mock_run_command(cmd, cwd_path, timeout=600, progress_callback=None):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="Reply with memory", stderr="")
+
+        test_cid = "cross_provider_conv_1"
+        main.in_memory_chats[test_cid] = [
+            {"role": "user", "content": "My secret code is 4242"},
+            {"role": "assistant", "content": "I have remembered your secret code."},
+        ]
+
+        try:
+            with (
+                mock.patch.object(main, "get_existing_db_ids", return_value=set()),
+                mock.patch.object(main, "run_agy_command", side_effect=mock_run_command),
+            ):
+                reply, cid = main.run_agy_cli(
+                    message="What was my code?",
+                    model_ui_name="Gemini 3.8 Flash (High)",
+                    conversation_id=test_cid,
+                    target="Sandbox",
+                    workspace="KookAI",
+                )
+                sent_prompt = calls[0][-1]
+                self.assertIn("[Previous Conversation History]", sent_prompt)
+                self.assertIn("My secret code is 4242", sent_prompt)
+                self.assertIn("[End of Previous Conversation History]", sent_prompt)
+                self.assertIn("What was my code?", sent_prompt)
+        finally:
+            main.in_memory_chats.pop(test_cid, None)
+
+    def test_get_existing_db_ids_includes_antigravity_cli(self):
+        dbs = main.get_existing_db_ids()
+        # Ensure that active antigravity-cli directory DBs are discovered
+        self.assertIsInstance(dbs, set)
+        self.assertGreater(len(dbs), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
